@@ -202,7 +202,9 @@ async def set_bot_commands_for_scopes(client: Client):
 
         # Admin commands shown to admins in private chats
         admin_private_cmds = default_cmds + [
+            BotCommand("forward", "Forward/copy a replied message to a chat"),
             BotCommand("admin", "Open admin panel"),
+            BotCommand("topics", "List topics for a managed group (use: /topics 1)"),
             BotCommand("addgroup", "Add group to managed list"),
             BotCommand("removegroup", "Remove managed group"),
             BotCommand("listgroups", "List managed groups"),
@@ -218,6 +220,7 @@ async def set_bot_commands_for_scopes(client: Client):
 
         # Group admin commands (for administrators in managed groups)
         group_admin_cmds = [
+            BotCommand("forward", "Forward/copy a replied message to a chat"),
             BotCommand("mute", "Mute a user (reply)"),
             BotCommand("unmute", "Unmute a user (reply)"),
             BotCommand("kick", "Kick a user (reply)"),
@@ -468,6 +471,7 @@ async def handle_start(client: Client, message: Message):
                 "/listgroups - List managed groups\n"
                 "/groupinfo - Get group info\n"
                 "/say <chat_id> <text> - Send text as bot to a chat\n"
+                "/forward <index_or_id> (reply) - Forward/copy a replied message to a managed group\n"
                 "/send_photo <chat_id> (reply) - Copy/send photo\n"
                 "/send_video <chat_id> (reply) - Copy/send video\n"
                 "/send_document <chat_id> (reply) - Copy/send document\n"
@@ -501,6 +505,8 @@ async def handle_help(client: Client, message: Message):
                 "/addgroup - Add group to managed list\n"
                 "/removegroup - Remove managed group\n"
                 "/listgroups - Show all managed groups\n"
+                "/topics - List topics in a group (use in group or /topics <index> in private)\n"
+                "/forward - Forward/copy a replied message to a managed group\n"
                 "/editgroupname - Edit group display name\n"
                 "/groupinfo - Get info about a group\n"
                 "/mute @user - Mute user (group only)\n"
@@ -858,6 +864,65 @@ async def handle_topics(client: Client, message: Message):
         await message.reply_text(f"❌ Error: {str(e)[:100]}")
 
 
+@app.on_message(filters.command("topics") & filters.private)
+async def handle_topics_private(client: Client, message: Message):
+    """List topics for a managed group by index or ID in private chat. Usage: /topics <index_or_id>"""
+    try:
+        if not is_admin(message.from_user.id):
+            await message.reply_text("❌ Admin only")
+            return
+
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            await message.reply_text("📝 Usage: /topics <index_or_id>\nUse /listgroups to see group indices")
+            return
+
+        target_str = args[1]
+        group_id, group_id_str, is_index = _get_group_id_from_index(target_str)
+        normalized_gid = _normalize_group_id(group_id_str)
+
+        groups = load_managed_groups()
+        if group_id_str not in groups and str(normalized_gid) not in groups:
+            await message.reply_text(f"❌ Group {target_str} not found in managed groups\nUse /listgroups to see available groups")
+            return
+
+        try:
+            topics_text = f"📋 **Topics in {groups.get(str(normalized_gid), groups.get(group_id_str,{})).get('name','Group')}**\n\n"
+            topic_count = 0
+            # Try modern Pyrogram get_forum_topics
+            try:
+                async for topic in client.get_forum_topics(normalized_gid):
+                    topic_count += 1
+                    topic_id = getattr(topic, 'id', 'Unknown')
+                    topic_title = getattr(topic, 'title', 'Unknown')
+                    icon = getattr(topic, 'icon_emoji', '📁')
+                    topics_text += f"{icon} **{topic_title}**\n   ID: `{topic_id}`\n   Usage: `topic_{topic_id}` or \"{topic_title}\"\n\n"
+            except Exception as e:
+                logger.debug(f"Could not get forum topics: {e}")
+                topics_text = "❌ Automatic topic detection not available.\n\n"
+                topics_text += "**🔧 Manual Topic Setup:**\nUse `/addtopic \"Topic Name\" topic_id` to add topics manually.\n\n"
+                topics = load_topics()
+                chat_id_str = str(normalized_gid)
+                if chat_id_str in topics and topics[chat_id_str]:
+                    for topic_name, topic_id in topics[chat_id_str].items():
+                        topics_text += f"📁 **{topic_name.title()}**\n   ID: `{topic_id}`\n   Usage: `\"{topic_name.title()}\"`\n\n"
+                else:
+                    topics_text += "No manual topics added yet.\n\n"
+
+            if topic_count == 0 and "Automatic topic detection" not in topics_text:
+                topics_text = "📭 This group has no topics (not a forum group)"
+            elif topic_count > 0:
+                topics_text += f"**Total: {topic_count} topics**\n\n"
+
+            await message.reply_text(topics_text)
+        except Exception as e:
+            await message.reply_text(f"❌ Error getting topics for group {target_str}: {str(e)[:100]}")
+            logger.error(f"❌ Topics error (private): {e}")
+    except Exception as e:
+        logger.error(f"❌ Error in handle_topics_private: {e}")
+        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+
+
 @app.on_message(filters.command("addtopic") & filters.group)
 async def handle_addtopic(client: Client, message: Message):
     """Add a manual topic mapping (group admin only). Usage: /addtopic "Topic Name" topic_id"""
@@ -1206,68 +1271,114 @@ async def _copy_media_to_target(client: Client, source_msg: Message, target_chat
     """
     if not source_msg:
         raise ValueError("No source message to copy")
+    # Determine message id
+    source_msg_id = getattr(source_msg, 'id', None) or getattr(source_msg, 'message_id', None)
+    if source_msg_id is None:
+        logger.debug(f"Source message attributes: {dir(source_msg)}")
+        raise ValueError("Source message has no message_id or id")
+
+    logger.debug(f"Copying message {source_msg_id} from {getattr(getattr(source_msg,'chat',None),'id',None)} to {target_chat} (topic={topic_id})")
 
     try:
-        # Try different ways to get message ID
-        source_msg_id = getattr(source_msg, 'id', None)
-        if source_msg_id is None:
-            source_msg_id = getattr(source_msg, 'message_id', None)
-        
-        if source_msg_id is None:
-            logger.debug(f"Source message attributes: {dir(source_msg)}")
-            raise ValueError("Source message has no message_id or id")
-        
-        logger.debug(f"Copying message {source_msg_id} from {source_msg.chat.id} to {target_chat}")
-        
+        # Prefer server-side copy (no re-upload). Try variants that different
+        # Pyrogram versions may expect: `message_thread_id` or `reply_to_message_id`.
         if topic_id:
-            # For topics, download and re-upload the media
-            await _download_and_upload_to_topic(client, source_msg, target_chat, topic_id)
+            try:
+                await _attempt_copy_with_thread(client, target_chat, source_msg.chat.id, source_msg_id, topic_id)
+                return
+            except Exception as e:
+                logger.warning(f"Copy to topic failed, falling back to download+upload: {e}")
+                await _download_and_upload_to_topic(client, source_msg, target_chat, topic_id)
+                return
         else:
-            # No topic, use normal copy
-            await client.copy_message(target_chat, source_msg.chat.id, source_msg_id)
-            
+            try:
+                await client.copy_message(target_chat, source_msg.chat.id, source_msg_id)
+                return
+            except TypeError as e:
+                # Some pyrogram versions may raise TypeError for unexpected args
+                logger.warning(f"copy_message without thread failed: {e}. Trying forward_messages as fallback")
+                await client.forward_messages(target_chat, source_msg.chat.id, source_msg_id)
+                return
+            except Exception as e:
+                logger.warning(f"copy_message failed, falling back to download+upload: {e}")
+                await _download_and_upload_to_topic(client, source_msg, target_chat, None)
+                return
     except Exception as e:
         logger.error(f"Error in _copy_media_to_target: {e}")
         raise
+
+
+async def _attempt_copy_with_thread(client: Client, target_chat: str, from_chat: int, message_id: int, thread_id: int) -> str:
+    """Try to copy a message into a forum topic/thread using multiple possible parameter names.
+
+    Returns a short string describing which method succeeded.
+    Raises the last exception if all attempts fail.
+    """
+    last_exc = None
+    # Try with message_thread_id first
+    try:
+        await client.copy_message(target_chat, from_chat, message_id, message_thread_id=thread_id)
+        logger.info(f"Copied message into thread using copy_message(message_thread_id={thread_id})")
+        return "copy_message(message_thread_id)"
+    except TypeError as e:
+        last_exc = e
+        logger.debug(f"copy_message(message_thread_id=...) not supported: {e}")
+    except Exception as e:
+        last_exc = e
+        logger.debug(f"copy_message with message_thread_id failed: {e}")
+
+    # Try with reply_to_message_id (some pyrogram versions map this)
+    try:
+        await client.copy_message(target_chat, from_chat, message_id, reply_to_message_id=thread_id)
+        logger.info(f"Copied message into thread using copy_message(reply_to_message_id={thread_id})")
+        return "copy_message(reply_to_message_id)"
+    except Exception as e:
+        last_exc = e
+        logger.debug(f"copy_message(reply_to_message_id=...) failed: {e}")
+
+    # Do not attempt forward_messages with message_thread_id since some Pyrogram versions reject that kwarg.
+    # If both copy attempts failed, raise the last exception to let the caller fall back to upload.
+    raise last_exc
 
 
 async def _download_and_upload_to_topic(client: Client, source_msg: Message, target_chat: str, topic_id: int):
     """Download media from source message and upload to target topic using reply_to_message_id"""
     import tempfile
     import os
-    
+
     temp_file = None
     try:
-        # Download the media file
+        # Prefer streaming to a temp file to avoid large memory usage
         if source_msg.photo:
-            # Get the largest photo
-            photo_file = await client.download_media(source_msg.photo.file_id, in_memory=True)
-            # Use reply_to_message_id to target the topic (works in Pyrogram 2.0.x)
-            await client.send_photo(target_chat, photo_file, caption=source_msg.caption, reply_to_message_id=topic_id)
+            temp_file = await client.download_media(source_msg.photo.file_id)
+            await client.send_photo(target_chat, temp_file, caption=source_msg.caption, message_thread_id=topic_id)
         elif source_msg.video:
-            video_file = await client.download_media(source_msg.video.file_id, in_memory=True)
-            await client.send_video(target_chat, video_file, caption=source_msg.caption, reply_to_message_id=topic_id)
+            temp_file = await client.download_media(source_msg.video.file_id)
+            await client.send_video(target_chat, temp_file, caption=source_msg.caption, message_thread_id=topic_id)
         elif source_msg.document:
-            doc_file = await client.download_media(source_msg.document.file_id, in_memory=True)
-            await client.send_document(target_chat, doc_file, caption=source_msg.caption, reply_to_message_id=topic_id)
+            temp_file = await client.download_media(source_msg.document.file_id)
+            await client.send_document(target_chat, temp_file, caption=source_msg.caption, message_thread_id=topic_id)
         elif source_msg.audio:
-            audio_file = await client.download_media(source_msg.audio.file_id, in_memory=True)
-            await client.send_audio(target_chat, audio_file, caption=source_msg.caption, reply_to_message_id=topic_id)
+            temp_file = await client.download_media(source_msg.audio.file_id)
+            await client.send_audio(target_chat, temp_file, caption=source_msg.caption, message_thread_id=topic_id)
         elif source_msg.animation:
-            gif_file = await client.download_media(source_msg.animation.file_id, in_memory=True)
-            await client.send_animation(target_chat, gif_file, caption=source_msg.caption, reply_to_message_id=topic_id)
+            temp_file = await client.download_media(source_msg.animation.file_id)
+            await client.send_animation(target_chat, temp_file, caption=source_msg.caption, message_thread_id=topic_id)
         else:
-            # For other media types, try to download as file
-            media_file = await client.download_media(source_msg, in_memory=True)
-            await client.send_document(target_chat, media_file, caption=source_msg.caption, reply_to_message_id=topic_id)
-            
+            # Generic media download
+            temp_file = await client.download_media(source_msg)
+            await client.send_document(target_chat, temp_file, caption=source_msg.caption, message_thread_id=topic_id)
+
     except Exception as e:
         logger.error(f"Error in _download_and_upload_to_topic: {e}")
         raise
     finally:
         # Clean up temp file if created
-        if temp_file and os.path.exists(temp_file):
-            os.remove(temp_file)
+        try:
+            if temp_file and os.path.exists(temp_file):
+                os.remove(temp_file)
+        except Exception:
+            pass
 
 
 def _is_url(path: str) -> bool:
@@ -1429,17 +1540,20 @@ async def handle_send_photo(client: Client, message: Message):
         # Case 2: Photo attached to command message
         if message.photo:
             try:
-                await client.copy_message(
-                    normalized_gid, 
-                    message.chat.id, 
-                    getattr(message, 'message_id', None),
-                    message_thread_id=topic_id
-                )
+                if topic_id:
+                    method = await _attempt_copy_with_thread(client, normalized_gid, message.chat.id, getattr(message, 'message_id', None), topic_id)
+                else:
+                    await client.copy_message(
+                        normalized_gid,
+                        message.chat.id,
+                        getattr(message, 'message_id', None)
+                    )
+                    method = 'copy_message'
                 group_idx = _get_group_index(group_id_str)
                 idx_str = f"#{group_idx}" if group_idx > 0 else target_str
                 topic_str = f" (topic {topic_id})" if topic_id else ""
-                await message.reply_text(f"✅ Photo sent to group {idx_str}{topic_str}")
-                logger.info(f"✅ SEND_PHOTO (attached): Admin {sender.id} -> {target_str}{topic_str}")
+                await message.reply_text(f"✅ Photo sent to group {idx_str}{topic_str} (method: {method})")
+                logger.info(f"✅ SEND_PHOTO (attached): Admin {sender.id} -> {target_str}{topic_str} (method: {method})")
                 return
             except Exception as e:
                 await message.reply_text(f"❌ Failed to send photo: {str(e)[:100]}")
@@ -1596,17 +1710,20 @@ async def handle_send_video(client: Client, message: Message):
         # Case 2: Video attached to command message
         if message.video:
             try:
-                await client.copy_message(
-                    normalized_gid, 
-                    message.chat.id, 
-                    getattr(message, 'message_id', None),
-                    message_thread_id=topic_id
-                )
+                if topic_id:
+                    method = await _attempt_copy_with_thread(client, normalized_gid, message.chat.id, getattr(message, 'message_id', None), topic_id)
+                else:
+                    await client.copy_message(
+                        normalized_gid,
+                        message.chat.id,
+                        getattr(message, 'message_id', None)
+                    )
+                    method = 'copy_message'
                 group_idx = _get_group_index(group_id_str)
                 idx_str = f"#{group_idx}" if group_idx > 0 else target_str
                 topic_str = f" (topic {topic_id})" if topic_id else ""
-                await message.reply_text(f"✅ Video sent to group {idx_str}{topic_str}")
-                logger.info(f"✅ SEND_VIDEO (attached): Admin {sender.id} -> {target_str}{topic_str}")
+                await message.reply_text(f"✅ Video sent to group {idx_str}{topic_str} (method: {method})")
+                logger.info(f"✅ SEND_VIDEO (attached): Admin {sender.id} -> {target_str}{topic_str} (method: {method})")
                 return
             except Exception as e:
                 await message.reply_text(f"❌ Failed to send video: {str(e)[:100]}")
@@ -1763,17 +1880,20 @@ async def handle_send_document(client: Client, message: Message):
         # Case 2: Document attached to command message
         if message.document:
             try:
-                await client.copy_message(
-                    normalized_gid, 
-                    message.chat.id, 
-                    getattr(message, 'message_id', None),
-                    message_thread_id=topic_id
-                )
+                if topic_id:
+                    method = await _attempt_copy_with_thread(client, normalized_gid, message.chat.id, getattr(message, 'message_id', None), topic_id)
+                else:
+                    await client.copy_message(
+                        normalized_gid,
+                        message.chat.id,
+                        getattr(message, 'message_id', None)
+                    )
+                    method = 'copy_message'
                 group_idx = _get_group_index(group_id_str)
                 idx_str = f"#{group_idx}" if group_idx > 0 else target_str
                 topic_str = f" (topic {topic_id})" if topic_id else ""
-                await message.reply_text(f"✅ Document sent to group {idx_str}{topic_str}")
-                logger.info(f"✅ SEND_DOCUMENT (attached): Admin {sender.id} -> {target_str}{topic_str}")
+                await message.reply_text(f"✅ Document sent to group {idx_str}{topic_str} (method: {method})")
+                logger.info(f"✅ SEND_DOCUMENT (attached): Admin {sender.id} -> {target_str}{topic_str} (method: {method})")
                 return
             except Exception as e:
                 await message.reply_text(f"❌ Failed to send document: {str(e)[:100]}")
@@ -1802,6 +1922,140 @@ async def handle_send_document(client: Client, message: Message):
     except Exception as e:
         logger.error(f"❌ Error in send_document: {e}")
         await message.reply_text(f"❌ Error sending document: {str(e)[:100]}")
+
+
+@app.on_message(filters.command("forward") & filters.group)
+async def handle_forward_group(client: Client, message: Message):
+    """Forward or copy a replied message to a managed group. Usage: /forward <index_or_id> [topic]
+    Reply to the message you want to forward in the source group, then run this command."""
+    try:
+        sender = message.from_user
+        if not sender:
+            await message.reply_text("❌ Unable to verify user identity")
+            return
+
+        # require admin in source group
+        is_admin_check = await _is_chat_admin(client, message.chat.id, sender.id)
+        if not is_admin_check:
+            await message.reply_text("❌ You need to be group admin to use this command")
+            return
+
+        if not message.reply_to_message:
+            await message.reply_text("❌ Reply to the message you want to forward")
+            return
+
+        args = message.text.split(maxsplit=2)
+        if len(args) < 2:
+            await message.reply_text("📝 Usage: /forward <index_or_id> [topic]")
+            return
+
+        target_str = args[1]
+        topic_id_str = args[2] if len(args) >= 3 else None
+
+        group_id, group_id_str, is_index = _get_group_id_from_index(target_str)
+        normalized_gid = _normalize_group_id(group_id_str)
+
+        groups = load_managed_groups()
+        if group_id_str not in groups and str(normalized_gid) not in groups:
+            await message.reply_text(f"❌ Group {target_str} not found in managed groups\nUse /listgroups to see available groups")
+            return
+
+        topic_id = None
+        if topic_id_str:
+            topic_id = await _resolve_topic_id(client, normalized_gid, topic_id_str)
+            if not topic_id:
+                await message.reply_text(f"⚠️ Could not resolve topic '{topic_id_str}'. Forwarding to general chat.")
+
+        # Perform forwarding or copying depending on whether a topic is targeted
+        src_msg = message.reply_to_message
+        src_msg_id = getattr(src_msg, 'message_id', None)
+        try:
+            if topic_id:
+                method = await _attempt_copy_with_thread(client, normalized_gid, src_msg.chat.id, src_msg_id, topic_id)
+            else:
+                # try forward (fast) — server-side forward
+                await client.forward_messages(normalized_gid, src_msg.chat.id, src_msg_id)
+                method = 'forward_messages'
+
+            group_idx = _get_group_index(group_id_str)
+            idx_str = f"#{group_idx}" if group_idx > 0 else target_str
+            topic_str = f" (topic {topic_id})" if topic_id else ""
+            await message.reply_text(f"✅ Message forwarded to group {idx_str}{topic_str} (method: {method})")
+            logger.info(f"✅ FORWARD: Admin {sender.id} -> {target_str}{topic_str} (method: {method})")
+            record_user_interaction(sender, message.chat)
+        except Exception as e:
+            logger.error(f"❌ Forward error: {e}")
+            # Try copy fallback
+            try:
+                await _copy_media_to_target(client, src_msg, normalized_gid, topic_id)
+                await message.reply_text("✅ Message copied to target (fallback)")
+            except Exception as e2:
+                await message.reply_text(f"❌ Failed to forward/copy message: {str(e2)[:100]}")
+    except Exception as e:
+        logger.error(f"❌ Error in forward (group): {e}")
+        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+
+
+@app.on_message(filters.command("forward") & filters.private)
+async def handle_forward_private(client: Client, message: Message):
+    """Forward or copy a replied message (in private) to a managed group. Usage: /forward <index_or_id> [topic]
+    Reply to a message you sent to the bot or attach a message to forward."""
+    try:
+        sender = message.from_user
+        if not is_admin(sender.id):
+            await message.reply_text("❌ Admin only")
+            return
+
+        if not message.reply_to_message:
+            await message.reply_text("❌ Reply to the message you want to forward (or send/attach it to the bot)")
+            return
+
+        args = message.text.split(maxsplit=2)
+        if len(args) < 2:
+            await message.reply_text("📝 Usage: /forward <index_or_id> [topic]")
+            return
+
+        target_str = args[1]
+        topic_id_str = args[2] if len(args) >= 3 else None
+
+        group_id, group_id_str, is_index = _get_group_id_from_index(target_str)
+        normalized_gid = _normalize_group_id(group_id_str)
+
+        groups = load_managed_groups()
+        if group_id_str not in groups and str(normalized_gid) not in groups:
+            await message.reply_text(f"❌ Group {target_str} not found in managed groups\nUse /listgroups to see available groups")
+            return
+
+        topic_id = None
+        if topic_id_str:
+            topic_id = await _resolve_topic_id(client, normalized_gid, topic_id_str)
+            if not topic_id:
+                await message.reply_text(f"⚠️ Could not resolve topic '{topic_id_str}'. Sending to general chat.")
+
+        src_msg = message.reply_to_message
+        try:
+            if topic_id:
+                method = await _attempt_copy_with_thread(client, normalized_gid, src_msg.chat.id, getattr(src_msg, 'message_id', None), topic_id)
+            else:
+                await client.forward_messages(normalized_gid, src_msg.chat.id, getattr(src_msg, 'message_id', None))
+                method = 'forward_messages'
+
+            group_idx = _get_group_index(group_id_str)
+            idx_str = f"#{group_idx}" if group_idx > 0 else target_str
+            topic_str = f" (topic {topic_id})" if topic_id else ""
+            await message.reply_text(f"✅ Message forwarded to group {idx_str}{topic_str} (method: {method})")
+            logger.info(f"✅ FORWARD (private): Admin {sender.id} -> {target_str}{topic_str} (method: {method})")
+            record_user_interaction(sender, message.chat)
+        except Exception as e:
+            logger.error(f"❌ Forward error (private): {e}")
+            try:
+                await _copy_media_to_target(client, src_msg, normalized_gid, topic_id)
+                await message.reply_text("✅ Message copied to target (fallback)")
+            except Exception as e2:
+                await message.reply_text(f"❌ Failed to forward/copy message: {str(e2)[:100]}")
+    except Exception as e:
+        logger.error(f"❌ Error in forward (private): {e}")
+        await message.reply_text(f"❌ Error: {str(e)[:100]}")
 
 
 @app.on_message(filters.command("broadcast") & filters.private)
